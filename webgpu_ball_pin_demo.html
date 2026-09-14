@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebGPU Ball & Pin Demo</title>
+<style>
+  html,body{margin:0;height:100%;background:#090b10;color:#eee;font-family:system-ui,sans-serif;overflow:hidden}
+  #wrap{height:100%;display:flex;flex-direction:column;align-items:center}
+  #bar{height:52px;display:flex;align-items:center;gap:14px;font-size:14px}
+  button{padding:7px 12px;border:0;border-radius:7px;cursor:pointer}
+  canvas{display:block;width:min(900px,96vw);height:calc(100vh - 70px);border-radius:12px;background:#111722}
+  #status{opacity:.75}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar">
+    <b>WebGPU Ball & Pin</b>
+    <button id="reset">Reset</button>
+    <span id="status">initializing…</span>
+  </div>
+  <canvas id="c"></canvas>
+</div>
+
+<script type="module">
+const canvas = document.querySelector('#c');
+const status = document.querySelector('#status');
+const resetBtn = document.querySelector('#reset');
+
+if (!navigator.gpu) {
+  status.textContent = 'WebGPU를 지원하지 않는 브라우저입니다.';
+  throw new Error('WebGPU unavailable');
+}
+
+const adapter = await navigator.gpu.requestAdapter();
+if (!adapter) throw new Error('No GPU adapter');
+const device = await adapter.requestDevice();
+
+const ctx = canvas.getContext('webgpu');
+const format = navigator.gpu.getPreferredCanvasFormat();
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.floor(canvas.clientWidth * dpr);
+  const h = Math.floor(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    ctx.configure({device, format, alphaMode:'opaque'});
+  }
+}
+resize();
+addEventListener('resize', resize);
+
+const BALLS = 500;
+const PINS = 180;
+const BALL_STRIDE = 8; // x,y,vx,vy,r,pad,pad,pad
+const ballData = new Float32Array(BALLS * BALL_STRIDE);
+const pinData = new Float32Array(PINS * 4); // x,y,r,pad
+
+function makeScene() {
+  ballData.fill(0);
+  for (let i=0;i<BALLS;i++) {
+    const x = (Math.random()*2-1)*0.72;
+    const y = -0.88 + Math.random()*0.10;
+    ballData[i*8+0] = x;
+    ballData[i*8+1] = y;
+    ballData[i*8+2] = (Math.random()*2-1)*0.15;
+    ballData[i*8+3] = 0.15 + Math.random()*0.25;
+    ballData[i*8+4] = 0.014;
+  }
+  let n=0;
+  for (let row=0;row<10;row++) {
+    const count=18;
+    const y=0.72-row*0.15;
+    const offset=(row%2)*0.075;
+    for(let col=0;col<count && n<PINS;col++){
+      const x=-0.64+col*0.075+offset;
+      pinData[n*4+0]=x;
+      pinData[n*4+1]=y;
+      pinData[n*4+2]=0.022;
+      n++;
+    }
+  }
+}
+makeScene();
+
+const ballBuffer = device.createBuffer({
+  size: ballData.byteLength,
+  usage: GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.VERTEX
+});
+const pinBuffer = device.createBuffer({
+  size: pinData.byteLength,
+  usage: GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST
+});
+const uniformBuffer = device.createBuffer({
+  size: 32,
+  usage: GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST
+});
+device.queue.writeBuffer(ballBuffer,0,ballData);
+device.queue.writeBuffer(pinBuffer,0,pinData);
+
+const computeCode = `
+struct Ball { p: vec2<f32>, v: vec2<f32>, r: f32, a: vec3<f32> };
+struct Pin { p: vec2<f32>, r: f32, a: f32 };
+struct Params { dt:f32, count:u32, pinCount:u32, pad:u32 };
+
+@group(0) @binding(0) var<storage,read_write> balls:array<Ball>;
+@group(0) @binding(1) var<storage,read> pins:array<Pin>;
+@group(0) @binding(2) var<uniform> params:Params;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id:vec3<u32>) {
+  let i=id.x;
+  if(i>=params.count){return;}
+  var b=balls[i];
+
+  b.v.y += -1.25 * params.dt;
+  b.p += b.v * params.dt;
+
+  if(b.p.x < -0.92+b.r){b.p.x=-0.92+b.r; b.v.x=abs(b.v.x)*0.82;}
+  if(b.p.x >  0.92-b.r){b.p.x= 0.92-b.r; b.v.x=-abs(b.v.x)*0.82;}
+  if(b.p.y < -0.92+b.r){b.p.y=-0.92+b.r; b.v.y=abs(b.v.y)*0.78;}
+
+  for(var j:u32=0u;j<params.pinCount;j++){
+    let pin=pins[j];
+    let d=b.p-pin.p;
+    let dist=length(d);
+    let minD=b.r+pin.r;
+    if(dist<minD && dist>0.00001){
+      let n=d/dist;
+      b.p=pin.p+n*(minD+0.0005);
+      let vn=dot(b.v,n);
+      if(vn<0.0){b.v -= 1.72*vn*n; b.v*=0.985;}
+    }
+  }
+  balls[i]=b;
+}
+`;
+
+const renderCode = `
+struct Ball { p: vec2<f32>, v: vec2<f32>, r: f32, a: vec3<f32> };
+@group(0) @binding(0) var<storage,read> balls:array<Ball>;
+
+struct VSOut { @builtin(position) pos:vec4<f32>, @location(0) uv:vec2<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) vi:u32,@builtin(instance_index) bi:u32)->VSOut{
+  let b=balls[bi];
+  let q=array<vec2<f32>,6>(
+    vec2(-1,-1),vec2(1,-1),vec2(-1,1),
+    vec2(-1,1),vec2(1,-1),vec2(1,1)
+  );
+  var o:VSOut;
+  o.uv=q[vi];
+  o.pos=vec4(b.p+q[vi]*b.r,0,1);
+  return o;
+}
+
+@fragment
+fn fs(in:VSOut)->@location(0) vec4<f32>{
+  let d=length(in.uv);
+  if(d>1.0){discard;}
+  let glow=0.55+0.45*(1.0-d);
+  return vec4(1.0,0.72,0.20,glow);
+}
+`;
+
+const pinRenderCode = `
+struct Pin { p:vec2<f32>, r:f32, a:f32 };
+@group(0) @binding(0) var<storage,read> pins:array<Pin>;
+struct O{@builtin(position) pos:vec4<f32>;@location(0) uv:vec2<f32>};
+
+@vertex fn vs(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->O{
+ let p=pins[ii];
+ let q=array<vec2<f32>,6>(vec2(-1,-1),vec2(1,-1),vec2(-1,1),vec2(-1,1),vec2(1,-1),vec2(1,1));
+ var o:O;o.uv=q[vi];o.pos=vec4(p.p+q[vi]*p.r,0,1);return o;
+}
+@fragment fn fs(o:O)->@location(0) vec4<f32>{
+ if(length(o.uv)>1.0){discard;} return vec4(0.35,0.75,1.0,1);
+}
+`;
+
+const cMod=device.createShaderModule({code:computeCode});
+const rMod=device.createShaderModule({code:renderCode});
+const pMod=device.createShaderModule({code:pinRenderCode});
+
+const computeLayout=device.createBindGroupLayout({
+ entries:[
+  {binding:0,visibility:GPUShaderStage.COMPUTE,buffer:{type:'storage'}},
+  {binding:1,visibility:GPUShaderStage.COMPUTE,buffer:{type:'read-only-storage'}},
+  {binding:2,visibility:GPUShaderStage.COMPUTE,buffer:{type:'uniform'}}
+ ]
+});
+const computePipe=device.createComputePipeline({
+ layout:device.createPipelineLayout({bindGroupLayouts:[computeLayout]}),
+ compute:{module:cMod,entryPoint:'main'}
+});
+const computeBG=device.createBindGroup({
+ layout:computeLayout,
+ entries:[
+  {binding:0,resource:{buffer:ballBuffer}},
+  {binding:1,resource:{buffer:pinBuffer}},
+  {binding:2,resource:{buffer:uniformBuffer}}
+ ]
+});
+
+const renderLayout=device.createBindGroupLayout({
+ entries:[{binding:0,visibility:GPUShaderStage.VERTEX,buffer:{type:'read-only-storage'}}]
+});
+const renderPipe=device.createRenderPipeline({
+ layout:device.createPipelineLayout({bindGroupLayouts:[renderLayout]}),
+ vertex:{module:rMod,entryPoint:'vs'},
+ fragment:{module:rMod,entryPoint:'fs',targets:[{format}]},
+ primitive:{topology:'triangle-list'}
+});
+const renderBG=device.createBindGroup({
+ layout:renderLayout,entries:[{binding:0,resource:{buffer:ballBuffer}}]
+});
+
+const pinLayout=device.createBindGroupLayout({
+ entries:[{binding:0,visibility:GPUShaderStage.VERTEX,buffer:{type:'read-only-storage'}}]
+});
+const pinPipe=device.createRenderPipeline({
+ layout:device.createPipelineLayout({bindGroupLayouts:[pinLayout]}),
+ vertex:{module:pMod,entryPoint:'vs'},
+ fragment:{module:pMod,entryPoint:'fs',targets:[{format}]},
+ primitive:{topology:'triangle-list'}
+});
+const pinBG=device.createBindGroup({
+ layout:pinLayout,entries:[{binding:0,resource:{buffer:pinBuffer}}]
+});
+
+let running=true,last=performance.now(),fps=0,frames=0,ft=performance.now();
+
+function reset(){
+ makeScene();
+ device.queue.writeBuffer(ballBuffer,0,ballData);
+}
+resetBtn.onclick=reset;
+
+function frame(now){
+ resize();
+ const dt=Math.min((now-last)/1000,0.025); last=now;
+ // Multiple smaller GPU physics steps improve collision stability.
+ const steps=3, sdt=dt/steps;
+ device.queue.writeBuffer(uniformBuffer,0,new Uint32Array([0]));
+ const enc=device.createCommandEncoder();
+ for(let s=0;s<steps;s++){
+   const raw=new ArrayBuffer(16);
+   new DataView(raw).setFloat32(0,sdt,true);
+   new DataView(raw).setUint32(4,BALLS,true);
+   new DataView(raw).setUint32(8,PINS,true);
+   device.queue.writeBuffer(uniformBuffer,0,raw);
+   const pass=enc.beginComputePass();
+   pass.setPipeline(computePipe);pass.setBindGroup(0,computeBG);
+   pass.dispatchWorkgroups(Math.ceil(BALLS/64));pass.end();
+ }
+ const rp=enc.beginRenderPass({
+  colorAttachments:[{view:ctx.getCurrentTexture().createView(),
+  clearValue:{r:0.035,g:0.045,b:0.065,a:1},loadOp:'clear',storeOp:'store'}]
+ });
+ rp.setPipeline(pinPipe);rp.setBindGroup(0,pinBG);rp.draw(6,PINS);
+ rp.setPipeline(renderPipe);rp.setBindGroup(0,renderBG);rp.draw(6,BALLS);
+ rp.end();
+ device.queue.submit([enc.finish()]);
+
+ frames++;
+ if(now-ft>500){
+   fps=Math.round(frames*1000/(now-ft));frames=0;ft=now;
+   status.textContent=`WebGPU • ${BALLS} balls • ${PINS} pins • ${fps} FPS`;
+ }
+ requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
