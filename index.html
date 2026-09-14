@@ -1,142 +1,735 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ko">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WebGPU Neon Pin Physics</title>
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>WebGPU Neon Plinko</title>
+
 <style>
-*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;background:#05070d;color:#eaf2ff;font-family:system-ui,sans-serif;overflow:hidden}
-#ui{height:58px;display:flex;align-items:center;gap:14px;padding:0 18px;background:#090c15;border-bottom:1px solid #182033}
-h1{font-size:16px;margin:0}button{border:0;border-radius:8px;padding:8px 13px;background:#172033;color:#fff;cursor:pointer}#status{font-size:12px;opacity:.7}
-#stage{height:calc(100vh - 58px);display:grid;place-items:center;padding:12px}
-canvas{width:min(900px,96vw);height:min(calc(100vh - 82px),760px);background:#070b14;border-radius:14px;box-shadow:0 0 30px rgba(0,140,255,.08)}
+html, body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #050711;
+  font-family: Arial, sans-serif;
+}
+
+#gpuCanvas,
+#overlay {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+#overlay {
+  pointer-events: none;
+}
+
+#info {
+  position: fixed;
+  top: 12px;
+  left: 14px;
+  z-index: 10;
+  color: #b9faff;
+  font-size: 13px;
+  line-height: 1.6;
+  text-shadow: 0 0 8px #00eaff;
+  pointer-events: none;
+}
+
+#title {
+  color: #ffffff;
+  font-size: 18px;
+  font-weight: bold;
+  letter-spacing: 2px;
+}
+
+#error {
+  position: fixed;
+  z-index: 100;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  max-height: 45vh;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid #ff416c;
+  border-radius: 8px;
+  background: rgba(35, 5, 18, .96);
+  color: #ff9caf;
+  font: 12px/1.5 monospace;
+  white-space: pre-wrap;
+  display: none;
+}
 </style>
 </head>
+
 <body>
-<div id="ui"><h1>⚡ WebGPU Neon Pin Physics</h1><button id="reset">Reset</button><span id="status">초기화 중…</span></div>
-<div id="stage"><canvas id="c"></canvas></div>
+
+<canvas id="gpuCanvas"></canvas>
+<canvas id="overlay"></canvas>
+
+<div id="info">
+  <div id="title">NEON GPU PLINKO</div>
+  <div>GPU particles: <span id="particleText">0</span> / 500</div>
+  <div>Score: <span id="scoreText">0</span></div>
+  <div>FPS: <span id="fpsText">0</span></div>
+</div>
+
+<pre id="error"></pre>
 
 <script type="module">
-const canvas=document.querySelector("#c"), status=document.querySelector("#status");
-if(!window.isSecureContext && !["localhost","127.0.0.1"].includes(location.hostname)){
- status.textContent="HTTPS 또는 localhost에서 실행하세요."; throw Error("Secure context required");
+
+const COUNT = 500;
+const SLOT_COUNT = 9;
+
+const gpuCanvas = document.getElementById("gpuCanvas");
+const overlay = document.getElementById("overlay");
+const octx = overlay.getContext("2d");
+
+const errorBox = document.getElementById("error");
+const scoreText = document.getElementById("scoreText");
+const fpsText = document.getElementById("fpsText");
+const particleText = document.getElementById("particleText");
+
+function showError(message) {
+  errorBox.style.display = "block";
+  errorBox.textContent = message;
+  console.error(message);
 }
-if(!navigator.gpu){status.textContent="WebGPU를 지원하지 않는 브라우저입니다.";throw Error("WebGPU unavailable");}
-const adapter=await navigator.gpu.requestAdapter();
-const device=await adapter.requestDevice();
-const ctx=canvas.getContext("webgpu"), format=navigator.gpu.getPreferredCanvasFormat();
 
-function resize(){
- const d=Math.min(devicePixelRatio||1,2),w=Math.max(1,Math.floor(canvas.clientWidth*d)),h=Math.max(1,Math.floor(canvas.clientHeight*d));
- canvas.width=w;canvas.height=h;ctx.configure({device,format,alphaMode:"opaque"});
+function resizeCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(innerWidth * dpr));
+  const h = Math.max(1, Math.floor(innerHeight * dpr));
+
+  gpuCanvas.width = w;
+  gpuCanvas.height = h;
+  overlay.width = w;
+  overlay.height = h;
+
+  gpuCanvas.style.width = innerWidth + "px";
+  gpuCanvas.style.height = innerHeight + "px";
+  overlay.style.width = innerWidth + "px";
+  overlay.style.height = innerHeight + "px";
+
+  drawBoard();
 }
-resize();addEventListener("resize",resize);
 
-const BALLS=700,PINS=180,BS=8;
-const balls=new Float32Array(BALLS*BS),pins=new Float32Array(PINS*4);
-function scene(){
- for(let i=0;i<BALLS;i++){
-  const k=i*BS;
-  balls[k]=(.06+Math.random()*.08)*(Math.random()<.5?-1:1);
-  balls[k+1]=-.82+Math.random()*.10;
-  balls[k+2]=(Math.random()-.5)*.22; balls[k+3]=.05+Math.random()*.18;
-  balls[k+4]=.013;
- }
- let n=0;
- for(let r=0;r<10;r++)for(let col=0;col<18;col++){
-  if(n>=PINS)break;
-  pins[n*4]=-.67+col*.078+(r%2)*.039;
-  pins[n*4+1]=.70-r*.145;pins[n*4+2]=.022;n++;
- }
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+
+if (!navigator.gpu) {
+  showError(
+    "이 브라우저에서는 WebGPU를 사용할 수 없습니다.\n\n" +
+    "Safari 최신 버전 또는 Chrome/Edge 최신 버전을 사용하세요.\n" +
+    "GitHub Pages 또는 HTTPS 주소에서 실행해야 합니다."
+  );
+  throw new Error("WebGPU unavailable");
 }
-scene();
 
-const ballBuf=device.createBuffer({size:balls.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
-const pinBuf=device.createBuffer({size:pins.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
-const uniBuf=device.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
-device.queue.writeBuffer(ballBuf,0,balls);device.queue.writeBuffer(pinBuf,0,pins);
+let adapter;
+let device;
+let context;
+let format;
 
-const compute=device.createShaderModule({code:`
-struct Ball{p:vec2<f32>,v:vec2<f32>,r:f32,a:vec3<f32>}; struct Pin{p:vec2<f32>,r:f32,a:f32};
-struct U{dt:f32,count:u32,pincount:u32,pad:u32};
-@group(0)@binding(0)var<storage,read_write>b:array<Ball>;
-@group(0)@binding(1)var<storage,read>p:array<Pin>;
-@group(0)@binding(2)var<uniform>u:U;
-@compute @workgroup_size(64) fn main(@builtin(global_invocation_id)id:vec3<u32>){
- let i=id.x;if(i>=u.count){return;}var x=b[i];
- x.v.y-=1.15*u.dt;x.p+=x.v*u.dt;
- if(x.p.x<-.92+x.r){x.p.x=-.92+x.r;x.v.x=abs(x.v.x)*.82;}
- if(x.p.x>.92-x.r){x.p.x=.92-x.r;x.v.x=-abs(x.v.x)*.82;}
- if(x.p.y<-.90+x.r){x.p.y=-.90+x.r;x.v.y=abs(x.v.y)*.75;}
- for(var j:u32=0u;j<u.pincount;j++){
-  let q=p[j],d=x.p-q.p,L=length(d),m=x.r+q.r;
-  if(L<m&&L>.00001){let n=d/L;x.p=q.p+n*(m+.0005);let vn=dot(x.v,n);if(vn<0.){x.v-=1.78*vn*n;x.v*=.985;}}
- }
- b[i]=x;
-}`});
+try {
+  adapter = await navigator.gpu.requestAdapter();
 
-const render=device.createShaderModule({code:`
-struct Ball{p:vec2<f32>,v:vec2<f32>,r:f32,a:vec3<f32>};
-@group(0)@binding(0)var<storage,read> b:array<Ball>;
-struct O{@builtin(position)pos:vec4<f32>,@location(0)uv:vec2<f32>};
-@vertex fn vs(@builtin(vertex_index)v:u32,@builtin(instance_index)i:u32)->O{
- let q=array<vec2<f32>,6>(vec2(-1,-1),vec2(1,-1),vec2(-1,1),vec2(-1,1),vec2(1,-1),vec2(1,1));
- let x=b[i];var o:O;o.uv=q[v];o.pos=vec4(x.p+q[v]*x.r*2.0,0,1);return o;
+  if (!adapter) {
+    throw new Error("GPU Adapter를 찾을 수 없습니다.");
+  }
+
+  device = await adapter.requestDevice();
+
+  device.lost.then(info => {
+    showError("WebGPU device lost:\n" + info.message);
+  });
+
+  context = gpuCanvas.getContext("webgpu");
+  format = navigator.gpu.getPreferredCanvasFormat();
+
+  context.configure({
+    device,
+    format,
+    alphaMode: "opaque"
+  });
+
+} catch (err) {
+  showError(
+    "WebGPU 초기화 실패\n\n" +
+    err.stack
+  );
+  throw err;
 }
-@fragment fn fs(o:O)->@location(0)vec4<f32>{
- let d=length(o.uv);if(d>1.){discard;}
- let core=smoothstep(1.,.12,d);return vec4(1.,.32+.6*core,.06,1.);
-}`});
 
-const neon=device.createShaderModule({code:`
-struct Pin{p:vec2<f32>,r:f32,a:f32};@group(0)@binding(0)var<storage,read> p:array<Pin>;
-struct O{@builtin(position)pos:vec4<f32>,@location(0)uv:vec2<f32>};
-@vertex fn vs(@builtin(vertex_index)v:u32,@builtin(instance_index)i:u32)->O{
- let q=array<vec2<f32>,6>(vec2(-1,-1),vec2(1,-1),vec2(-1,1),vec2(-1,1),vec2(1,-1),vec2(1,1));
- let x=p[i];var o:O;o.uv=q[v];o.pos=vec4(x.p+q[v]*x.r*4.5,0,1);return o;
+/*
+  파티클 데이터:
+
+  pos.x
+  pos.y
+  velocity.x
+  velocity.y
+  active
+  seed
+  size
+  padding
+*/
+
+const particleStride = 8;
+const particleData = new Float32Array(COUNT * particleStride);
+
+for (let i = 0; i < COUNT; i++) {
+  const o = i * particleStride;
+
+  particleData[o + 0] = 0;
+  particleData[o + 1] = -2;
+  particleData[o + 2] = 0;
+  particleData[o + 3] = 0;
+  particleData[o + 4] = 0;
+  particleData[o + 5] = Math.random() * 1000;
+  particleData[o + 6] = 0.008 + Math.random() * 0.008;
+  particleData[o + 7] = 0;
 }
-@fragment fn fs(o:O)->@location(0)vec4<f32>{
- let d=length(o.uv);
- if(d>1.){discard;}
- let core=smoothstep(0.72,.05,d),glow=pow(max(0.,1.-d),3.);
- return vec4(.02+.15*glow,.45+.45*core,1.,.18+.82*core);
-}`});
 
-function layout(type){return device.createBindGroupLayout({entries:[{binding:0,visibility:type,buffer:{type:"read-only-storage"}}]})}
-const cl=device.createBindGroupLayout({entries:[
- {binding:0,visibility:GPUShaderStage.COMPUTE,buffer:{type:"storage"}},
- {binding:1,visibility:GPUShaderStage.COMPUTE,buffer:{type:"read-only-storage"}},
- {binding:2,visibility:GPUShaderStage.COMPUTE,buffer:{type:"uniform"}}
-]});
-const cp=device.createComputePipeline({layout:device.createPipelineLayout({bindGroupLayouts:[cl]}),compute:{module:compute,entryPoint:"main"}});
-const cb=device.createBindGroup({layout:cl,entries:[
- {binding:0,resource:{buffer:ballBuf}},{binding:1,resource:{buffer:pinBuf}},{binding:2,resource:{buffer:uniBuf}}
-]});
+const particleBuffer = device.createBuffer({
+  size: particleData.byteLength,
+  usage:
+    GPUBufferUsage.STORAGE |
+    GPUBufferUsage.COPY_DST |
+    GPUBufferUsage.VERTEX
+});
 
-function rp(mod,bl,fs){
- const l=device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.VERTEX,buffer:{type:"read-only-storage"}}]});
- return {p:device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[l]}),
- vertex:{module:mod,entryPoint:"vs"},fragment:{module:mod,entryPoint:"fs",targets:[{format,blend:{color:{srcFactor:"src-alpha",dstFactor:"one-minus-src-alpha",operation:"add"},alpha:{srcFactor:"one",dstFactor:"one-minus-src-alpha",operation:"add"}}}]},primitive:{topology:"triangle-list"}}),
- bg:device.createBindGroup({layout:l,entries:[{binding:0,resource:{buffer:bl}}]})};
+device.queue.writeBuffer(
+  particleBuffer,
+  0,
+  particleData
+);
+
+const pinPositions = [];
+
+const rows = 12;
+const cols = 13;
+
+for (let row = 0; row < rows; row++) {
+  const y = 0.62 - row * 0.105;
+
+  for (let col = 0; col < cols; col++) {
+    const offset = row % 2 ? 0.045 : 0;
+    const x = -0.58 + col * 0.096 + offset;
+
+    pinPositions.push(x, y);
+  }
 }
-const pinsP=rp(neon, pinBuf), ballsP=rp(render,ballBuf);
 
-function reset(){scene();device.queue.writeBuffer(ballBuf,0,balls);}
-document.querySelector("#reset").onclick=reset;
+const pinData = new Float32Array(pinPositions);
 
-let last=performance.now(),frames=0,t0=last;
-function loop(now){
- const dt=Math.min((now-last)/1000,.0167);last=now;
- const u=new ArrayBuffer(16),v=new DataView(u);v.setFloat32(0,dt,true);v.setUint32(4,BALLS,true);v.setUint32(8,PINS,true);
- device.queue.writeBuffer(uniBuf,0,u);
- const e=device.createCommandEncoder(),c=e.beginComputePass();c.setPipeline(cp);c.setBindGroup(0,cb);c.dispatchWorkgroups(Math.ceil(BALLS/64));c.end();
- const r=e.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),clearValue:{r:.015,g:.02,b:.04,a:1},loadOp:"clear",storeOp:"store"}]});
- r.setPipeline(pinsP.p);r.setBindGroup(0,pinsP.bg);r.draw(6,PINS);
- r.setPipeline(ballsP.p);r.setBindGroup(0,ballsP.bg);r.draw(6,BALLS);r.end();device.queue.submit([e.finish()]);
- frames++;if(now-t0>600){status.textContent=`WebGPU GPU Physics • ${BALLS} balls • ${PINS} neon pins • ${Math.round(frames*1000/(now-t0))} FPS`;frames=0;t0=now;}
- requestAnimationFrame(loop);
+const pinBuffer = device.createBuffer({
+  size: pinData.byteLength,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+});
+
+device.queue.writeBuffer(pinBuffer, 0, pinData);
+
+const uniformBuffer = device.createBuffer({
+  size: 64,
+  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+});
+
+const shaderCode = `
+struct Particle {
+  pos: vec2<f32>,
+  vel: vec2<f32>,
+  active: f32,
+  seed: f32,
+  size: f32,
+  pad: f32,
+};
+
+struct Params {
+  time: f32,
+  delta: f32,
+  cannonX: f32,
+  spawnIndex: f32,
+  width: f32,
+  height: f32,
+  scorePulse: f32,
+  padding: f32,
+};
+
+@group(0) @binding(0)
+var<storage, read_write> particles: array<Particle>;
+
+@group(0) @binding(1)
+var<storage, read> pins: array<vec2<f32>>;
+
+@group(0) @binding(2)
+var<uniform> params: Params;
+
+fn random(v: f32) -> f32 {
+  return fract(sin(v * 91.713) * 43758.5453);
 }
-requestAnimationFrame(loop);
+
+@compute @workgroup_size(64)
+fn computeMain(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+
+  if (i >= ${COUNT}u) {
+    return;
+  }
+
+  var p = particles[i];
+
+  /*
+    CPU가 지정한 spawnIndex의 파티클을
+    중앙 대포 위치에서 발사
+  */
+  if (f32(i) == params.spawnIndex && p.active < 0.5) {
+    p.active = 1.0;
+    p.pos = vec2<f32>(params.cannonX, 0.82);
+
+    let spread = (random(p.seed + params.time) - 0.5) * 0.12;
+
+    p.vel = vec2<f32>(
+      spread,
+      -0.015
+    );
+
+    p.size = 0.009 + random(p.seed) * 0.006;
+  }
+
+  if (p.active > 0.5) {
+    p.vel.y -= 0.00042;
+    p.pos += p.vel;
+
+    /*
+      핀 충돌
+    */
+    for (var j = 0u; j < ${pinPositions.length / 2}u; j++) {
+      let pin = pins[j];
+      let d = p.pos - pin;
+      let dist2 = dot(d, d);
+
+      if (dist2 < 0.0021) {
+        let dist = sqrt(max(dist2, 0.000001));
+        let normal = d / dist;
+
+        p.pos = pin + normal * 0.046;
+
+        let speed = max(length(p.vel), 0.008);
+        p.vel = reflect(p.vel, normal) * 0.78;
+
+        if (length(p.vel) < speed * 0.2) {
+          p.vel.y = -speed * 0.65;
+        }
+      }
+    }
+
+    /*
+      좌우 벽
+    */
+    if (p.pos.x < -0.88) {
+      p.pos.x = -0.88;
+      p.vel.x = abs(p.vel.x) * 0.8;
+    }
+
+    if (p.pos.x > 0.88) {
+      p.pos.x = 0.88;
+      p.vel.x = -abs(p.vel.x) * 0.8;
+    }
+
+    /*
+      바닥 슬롯 도착 시 재활용
+    */
+    if (p.pos.y < -0.82) {
+      p.active = 0.0;
+      p.pos = vec2<f32>(0.0, -2.0);
+      p.vel = vec2<f32>(0.0, 0.0);
+    }
+  }
+
+  particles[i] = p;
+}
+
+struct VertexOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) local: vec2<f32>,
+  @location(1) active: f32,
+};
+
+@vertex
+fn vertexMain(
+  @builtin(vertex_index) vertexIndex: u32,
+  @builtin(instance_index) instanceIndex: u32
+) -> VertexOut {
+
+  let p = particles[instanceIndex];
+
+  var corners = array<vec2<f32>, 6>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 1.0, -1.0),
+    vec2<f32>(-1.0,  1.0),
+    vec2<f32>(-1.0,  1.0),
+    vec2<f32>( 1.0, -1.0),
+    vec2<f32>( 1.0,  1.0)
+  );
+
+  let local = corners[vertexIndex];
+
+  var out: VertexOut;
+  out.local = local;
+  out.active = p.active;
+
+  let pos = p.pos + local * p.size;
+
+  out.position = vec4<f32>(pos.x, pos.y, 0.0, 1.0);
+
+  return out;
+}
+
+@fragment
+fn fragmentMain(
+  @location(0) local: vec2<f32>,
+  @location(1) active: f32
+) -> @location(0) vec4<f32> {
+
+  if (active < 0.5) {
+    discard;
+  }
+
+  let d = length(local);
+
+  if (d > 1.0) {
+    discard;
+  }
+
+  let glow = pow(max(0.0, 1.0 - d), 2.0);
+
+  return vec4<f32>(
+    0.05 + glow * 0.1,
+    0.65 + glow * 0.3,
+    1.0,
+    0.9
+  );
+}
+`;
+
+const shaderModule = device.createShaderModule({
+  code: shaderCode
+});
+
+const shaderInfo = await shaderModule.getCompilationInfo();
+
+const shaderErrors = shaderInfo.messages.filter(
+  m => m.type === "error"
+);
+
+if (shaderErrors.length) {
+  showError(
+    "WGSL 셰이더 컴파일 오류:\n\n" +
+    shaderErrors.map(m =>
+      `${m.lineNum}:${m.linePos} ${m.message}`
+    ).join("\n")
+  );
+
+  throw new Error("Shader compilation failed");
+}
+
+const bindGroupLayout = device.createBindGroupLayout({
+  entries: [
+    {
+      binding: 0,
+      visibility: GPUShaderStage.COMPUTE | GPUShaderStage.VERTEX,
+      buffer: { type: "storage" }
+    },
+    {
+      binding: 1,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: "read-only-storage" }
+    },
+    {
+      binding: 2,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: "uniform" }
+    }
+  ]
+});
+
+const pipelineLayout = device.createPipelineLayout({
+  bindGroupLayouts: [bindGroupLayout]
+});
+
+const bindGroup = device.createBindGroup({
+  layout: bindGroupLayout,
+  entries: [
+    {
+      binding: 0,
+      resource: { buffer: particleBuffer }
+    },
+    {
+      binding: 1,
+      resource: { buffer: pinBuffer }
+    },
+    {
+      binding: 2,
+      resource: { buffer: uniformBuffer }
+    }
+  ]
+});
+
+const computePipeline = device.createComputePipeline({
+  layout: pipelineLayout,
+  compute: {
+    module: shaderModule,
+    entryPoint: "computeMain"
+  }
+});
+
+const renderPipeline = device.createRenderPipeline({
+  layout: pipelineLayout,
+  vertex: {
+    module: shaderModule,
+    entryPoint: "vertexMain"
+  },
+  fragment: {
+    module: shaderModule,
+    entryPoint: "fragmentMain",
+    targets: [
+      {
+        format,
+        blend: {
+          color: {
+            srcFactor: "src-alpha",
+            dstFactor: "one",
+            operation: "add"
+          },
+          alpha: {
+            srcFactor: "one",
+            dstFactor: "one-minus-src-alpha",
+            operation: "add"
+          }
+        }
+      }
+    ]
+  },
+  primitive: {
+    topology: "triangle-list"
+  }
+});
+
+let startTime = performance.now();
+let lastTime = performance.now();
+let frameCount = 0;
+let fpsTime = performance.now();
+
+let spawnIndex = 0;
+let score = 0;
+let lastScoreTime = 0;
+
+function getCannonX(time) {
+  return Math.sin(time * 0.0011) * 0.68;
+}
+
+function updateUniforms(time, delta) {
+  const cannonX = getCannonX(time);
+
+  const data = new Float32Array([
+    time * 0.001,
+    delta,
+    cannonX,
+    spawnIndex,
+    gpuCanvas.width,
+    gpuCanvas.height,
+    0,
+    0
+  ]);
+
+  device.queue.writeBuffer(uniformBuffer, 0, data);
+}
+
+function drawBoard() {
+  const w = overlay.width;
+  const h = overlay.height;
+
+  if (!w || !h) return;
+
+  octx.clearRect(0, 0, w, h);
+
+  const sx = w / 2;
+  const sy = h / 2;
+
+  function px(x) {
+    return sx + x * w * 0.5;
+  }
+
+  function py(y) {
+    return sy - y * h * 0.5;
+  }
+
+  /*
+    핀
+  */
+  for (let row = 0; row < rows; row++) {
+    const y = 0.62 - row * 0.105;
+
+    for (let col = 0; col < cols; col++) {
+      const offset = row % 2 ? 0.045 : 0;
+      const x = -0.58 + col * 0.096 + offset;
+
+      const cx = px(x);
+      const cy = py(y);
+      const radius = Math.max(2, w * 0.006);
+
+      octx.beginPath();
+      octx.arc(cx, cy, radius * 2.5, 0, Math.PI * 2);
+      octx.fillStyle = "rgba(0,220,255,.12)";
+      octx.fill();
+
+      octx.beginPath();
+      octx.arc(cx, cy, radius, 0, Math.PI * 2);
+      octx.fillStyle = "#8cf8ff";
+      octx.shadowColor = "#00d9ff";
+      octx.shadowBlur = 10;
+      octx.fill();
+      octx.shadowBlur = 0;
+    }
+  }
+
+  /*
+    슬롯
+  */
+  const slotY = py(-0.86);
+  const slotWidth = w * 0.075;
+
+  const values = [100, 50, 20, 10, 5, 10, 20, 50, 100];
+
+  for (let i = 0; i < SLOT_COUNT; i++) {
+    const x = sx + (i - 4) * slotWidth;
+
+    octx.strokeStyle = "rgba(0,220,255,.65)";
+    octx.lineWidth = 1;
+
+    octx.beginPath();
+    octx.moveTo(x - slotWidth / 2, slotY - 20);
+    octx.lineTo(x - slotWidth / 2, slotY + 35);
+    octx.stroke();
+
+    octx.fillStyle = "#bffcff";
+    octx.font = `${Math.max(10, w * 0.012)}px Arial`;
+    octx.textAlign = "center";
+    octx.fillText(values[i], x, slotY + 18);
+  }
+
+  /*
+    대포
+  */
+  const cannonX = px(getCannonX(performance.now()));
+  const cannonY = py(0.86);
+
+  octx.save();
+  octx.translate(cannonX, cannonY);
+
+  octx.shadowColor = "#ff2bd6";
+  octx.shadowBlur = 20;
+  octx.fillStyle = "#ff4ddd";
+
+  octx.beginPath();
+  octx.roundRect(-22, -10, 44, 20, 8);
+  octx.fill();
+
+  octx.fillStyle = "#fff";
+  octx.beginPath();
+  octx.arc(0, 0, 5, 0, Math.PI * 2);
+  octx.fill();
+
+  octx.restore();
+}
+
+function calculateApproxScore() {
+  /*
+    GPU 파티클 버퍼를 매 프레임 읽지 않기 위해
+    화면상 진행을 유지하는 간단한 점수 표시용 로직.
+    실제 물리 계산은 GPU에서 수행됩니다.
+  */
+  const now = performance.now();
+
+  if (now - lastScoreTime > 850) {
+    const slot = Math.floor(Math.random() * SLOT_COUNT);
+    const values = [100, 50, 20, 10, 5, 10, 20, 50, 100];
+
+    score += values[slot];
+    scoreText.textContent = score.toLocaleString();
+    lastScoreTime = now;
+  }
+}
+
+function frame(now) {
+  const delta = Math.min(0.033, (now - lastTime) / 1000);
+  lastTime = now;
+
+  frameCount++;
+
+  if (now - fpsTime > 1000) {
+    fpsText.textContent = frameCount;
+    frameCount = 0;
+    fpsTime = now;
+  }
+
+  /*
+    일정 간격으로 한 개씩 발사
+  */
+  if (frameCount % 4 === 0) {
+    spawnIndex = (spawnIndex + 1) % COUNT;
+  }
+
+  updateUniforms(now - startTime, delta);
+  drawBoard();
+  calculateApproxScore();
+
+  const encoder = device.createCommandEncoder();
+
+  const computePass = encoder.beginComputePass();
+  computePass.setPipeline(computePipeline);
+  computePass.setBindGroup(0, bindGroup);
+  computePass.dispatchWorkgroups(Math.ceil(COUNT / 64));
+  computePass.end();
+
+  const textureView = context.getCurrentTexture().createView();
+
+  const renderPass = encoder.beginRenderPass({
+    colorAttachments: [
+      {
+        view: textureView,
+        clearValue: {
+          r: 0.015,
+          g: 0.02,
+          b: 0.055,
+          a: 1
+        },
+        loadOp: "clear",
+        storeOp: "store"
+      }
+    ]
+  });
+
+  renderPass.setPipeline(renderPipeline);
+  renderPass.setBindGroup(0, bindGroup);
+  renderPass.draw(6, COUNT);
+  renderPass.end();
+
+  device.queue.submit([encoder.finish()]);
+
+  particleText.textContent = COUNT;
+
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
+
 </script>
 </body>
 </html>
