@@ -28,8 +28,12 @@ const canvas = document.querySelector('#c');
 const status = document.querySelector('#status');
 const resetBtn = document.querySelector('#reset');
 
+if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+  status.textContent = 'WebGPU는 HTTPS 또는 localhost에서 실행해야 합니다. 파일을 바로 열었다면 localhost로 실행하세요.';
+  throw new Error('WebGPU requires a secure context');
+}
 if (!navigator.gpu) {
-  status.textContent = 'WebGPU를 지원하지 않는 브라우저입니다.';
+  status.textContent = '이 브라우저에서 WebGPU를 사용할 수 없습니다.';
   throw new Error('WebGPU unavailable');
 }
 
@@ -42,12 +46,13 @@ const format = navigator.gpu.getPreferredCanvasFormat();
 
 function resize() {
   const dpr = Math.min(devicePixelRatio || 1, 2);
-  const w = Math.floor(canvas.clientWidth * dpr);
-  const h = Math.floor(canvas.clientHeight * dpr);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
   if (canvas.width !== w || canvas.height !== h) {
-    canvas.width = w; canvas.height = h;
-    ctx.configure({device, format, alphaMode:'opaque'});
+    canvas.width = w;
+    canvas.height = h;
   }
+  ctx.configure({device, format, alphaMode:'opaque'});
 }
 resize();
 addEventListener('resize', resize);
@@ -240,39 +245,60 @@ function reset(){
 resetBtn.onclick=reset;
 
 function frame(now){
- resize();
- const dt=Math.min((now-last)/1000,0.025); last=now;
- // Multiple smaller GPU physics steps improve collision stability.
- const steps=3, sdt=dt/steps;
- device.queue.writeBuffer(uniformBuffer,0,new Uint32Array([0]));
- const enc=device.createCommandEncoder();
- for(let s=0;s<steps;s++){
-   const raw=new ArrayBuffer(16);
-   new DataView(raw).setFloat32(0,sdt,true);
-   new DataView(raw).setUint32(4,BALLS,true);
-   new DataView(raw).setUint32(8,PINS,true);
-   device.queue.writeBuffer(uniformBuffer,0,raw);
-   const pass=enc.beginComputePass();
-   pass.setPipeline(computePipe);pass.setBindGroup(0,computeBG);
-   pass.dispatchWorkgroups(Math.ceil(BALLS/64));pass.end();
- }
- const rp=enc.beginRenderPass({
-  colorAttachments:[{view:ctx.getCurrentTexture().createView(),
-  clearValue:{r:0.035,g:0.045,b:0.065,a:1},loadOp:'clear',storeOp:'store'}]
- });
- rp.setPipeline(pinPipe);rp.setBindGroup(0,pinBG);rp.draw(6,PINS);
- rp.setPipeline(renderPipe);rp.setBindGroup(0,renderBG);rp.draw(6,BALLS);
- rp.end();
- device.queue.submit([enc.finish()]);
+  resize();
+  const dt=Math.min((now-last)/1000,0.0167);
+  last=now;
 
- frames++;
- if(now-ft>500){
-   fps=Math.round(frames*1000/(now-ft));frames=0;ft=now;
-   status.textContent=`WebGPU • ${BALLS} balls • ${PINS} pins • ${fps} FPS`;
- }
- requestAnimationFrame(frame);
+  const uniform = new ArrayBuffer(16);
+  const dv = new DataView(uniform);
+  dv.setFloat32(0, dt, true);
+  dv.setUint32(4, BALLS, true);
+  dv.setUint32(8, PINS, true);
+  dv.setUint32(12, 0, true);
+  device.queue.writeBuffer(uniformBuffer, 0, uniform);
+
+  const enc=device.createCommandEncoder();
+
+  const pass=enc.beginComputePass();
+  pass.setPipeline(computePipe);
+  pass.setBindGroup(0,computeBG);
+  pass.dispatchWorkgroups(Math.ceil(BALLS/64));
+  pass.end();
+
+  const rp=enc.beginRenderPass({
+    colorAttachments:[{
+      view:ctx.getCurrentTexture().createView(),
+      clearValue:{r:0.035,g:0.045,b:0.065,a:1},
+      loadOp:'clear',
+      storeOp:'store'
+    }]
+  });
+
+  rp.setPipeline(pinPipe);
+  rp.setBindGroup(0,pinBG);
+  rp.draw(6,PINS);
+
+  rp.setPipeline(renderPipe);
+  rp.setBindGroup(0,renderBG);
+  rp.draw(6,BALLS);
+  rp.end();
+
+  device.queue.submit([enc.finish()]);
+
+  frames++;
+  if(now-ft>500){
+    const fps=Math.round(frames*1000/(now-ft));
+    frames=0;ft=now;
+    status.textContent=`WebGPU • ${BALLS} balls • ${PINS} pins • ${fps} FPS`;
+  }
+  requestAnimationFrame(frame);
+}
+
 }
 requestAnimationFrame(frame);
+device.lost.then(info => {
+  status.textContent = 'GPU device lost: ' + info.message;
+});
 </script>
 </body>
 </html>
